@@ -347,6 +347,7 @@ typedef uint8_t pagelen_t;
  * supress some compile-time options we want.)
  */
 
+void pre_main(void) __attribute__ ((naked)) __attribute__ ((section (".init8")));
 int main(void) __attribute__ ((OS_main)) __attribute__ ((section (".init9")));
 
 void __attribute__((noinline)) putch(char);
@@ -361,6 +362,7 @@ static inline void writebuffer(int8_t memtype, uint8_t *mybuff,
 			       uint16_t address, pagelen_t len);
 static inline void read_mem(uint8_t memtype,
 			    uint16_t address, pagelen_t len);
+static void __attribute__((noinline)) do_spm(uint16_t address, uint8_t command, uint16_t data);
 
 #ifdef SOFT_UART
 void uartDelay() __attribute__ ((naked));
@@ -388,13 +390,37 @@ void appStart(uint8_t rstFlags) __attribute__ ((naked));
 /* These definitions are NOT zero initialised, but that doesn't matter */
 /* This allows us to drop the zero init code, saving us memory */
 #define buff    ((uint8_t*)(RAMSTART))
+
+/* Virtual boot partition support */
 #ifdef VIRTUAL_BOOT_PARTITION
 #define rstVect0_sav (*(uint8_t*)(RAMSTART+SPM_PAGESIZE*2+4))
 #define rstVect1_sav (*(uint8_t*)(RAMSTART+SPM_PAGESIZE*2+5))
 #define wdtVect0_sav (*(uint8_t*)(RAMSTART+SPM_PAGESIZE*2+6))
 #define wdtVect1_sav (*(uint8_t*)(RAMSTART+SPM_PAGESIZE*2+7))
+// Vector to save original reset jump:
+//   SPM Ready is least probably used, so it's default
+//   if not, use old way WDT_vect_num,
+//   or simply set custom save_vect_num in Makefile using vector name
+//   or even raw number.
+#if !defined (save_vect_num)
+#if defined (SPM_RDY_vect_num)
+#define save_vect_num (SPM_RDY_vect_num)
+#elif defined (SPM_READY_vect_num)
+#define save_vect_num (SPM_READY_vect_num)
+#elif defined (WDT_vect_num)
+#define save_vect_num (WDT_vect_num)
+#else
+#error Cant find SPM or WDT interrupt vector for this CPU
+#endif
+#endif //save_vect_num
+// check if it's on the same page (code assumes that)
+#if (SPM_PAGESIZE <= save_vect_num)
+#error Save vector not in the same page as reset!
+#endif
 #if FLASHEND > 8192
 // AVRs with more than 8k of flash have 4-byte vectors, and use jmp.
+//  We save only 16 bits of address, so devices with more than 128KB
+//  may behave wrong for upper part of address space.
 #define rstVect0 2
 #define rstVect1 3
 #define wdtVect0 (WDT_vect_num*4+2)
@@ -411,6 +437,18 @@ void appStart(uint8_t rstFlags) __attribute__ ((naked));
 #else
 #define appstart_vec (0)
 #endif // VIRTUAL_BOOT_PARTITION
+
+/* everything that needs to run VERY early */
+void pre_main(void) {
+	// Allow convenient way of calling do_spm function - jump table,
+	//   so entry to this function will always be here, indepedent of compilation,
+	//   features etc
+	asm volatile (
+	"	rjmp	1f\n"
+	"	rjmp	do_spm\n"
+	"1:\n"
+	);
+}
 
 
 /* main program starts here */
@@ -696,6 +734,7 @@ uint8_t getch(void) {
 #endif
 
 #ifdef SOFT_UART
+    watchdogReset();
   __asm__ __volatile__ (
     "1: sbic  %[uartPin],%[uartBit]\n"  // Wait for start edge
     "   rjmp  1b\n"
@@ -865,8 +904,7 @@ static inline void writebuffer(int8_t memtype, uint8_t *mybuff,
 	     * the serial link, but the performance improvement was slight,
 	     * and we needed the space back.
 	     */
-	    __boot_page_erase_short((uint16_t)(void*)address);
-	    boot_spm_busy_wait();
+	    do_spm((uint16_t)(void*)address,__BOOT_PAGE_ERASE,0);
 
 	    /*
 	     * Copy data from the buffer into the flash write buffer.
@@ -875,19 +913,14 @@ static inline void writebuffer(int8_t memtype, uint8_t *mybuff,
 		uint16_t a;
 		a = *bufPtr++;
 		a |= (*bufPtr++) << 8;
-		__boot_page_fill_short((uint16_t)(void*)addrPtr,a);
+		do_spm((uint16_t)(void*)addrPtr,__BOOT_PAGE_FILL,a);
 		addrPtr += 2;
 	    } while (len -= 2);
 
 	    /*
 	     * Actually Write the buffer to flash (and wait for it to finish.)
 	     */
-	    __boot_page_write_short((uint16_t)(void*)address);
-	    boot_spm_busy_wait();
-#if defined(RWWSRE)
-	    // Reenable read access to flash
-	    boot_rww_enable();
-#endif
+	    do_spm((uint16_t)(void*)address,__BOOT_PAGE_WRITE,0);
 	} // default block
 	break;
     } // switch
@@ -931,4 +964,51 @@ static inline void read_mem(uint8_t memtype, uint16_t address, pagelen_t length)
 	} while (--length);
 	break;
     } // switch
+}
+
+/*
+ * Separate function for doing spm stuff
+ * It's needed for application to do SPM, as SPM instruction works only
+ * from bootloader.
+ *
+ * How it works:
+ * - do SPM
+ * - wait for SPM to complete
+ * - if chip have RWW/NRWW sections it does additionaly:
+ *   - if command is WRITE or ERASE, AND data=0 then reenable RWW section
+ *
+ * In short:
+ * If you play erase-fill-write, just set data to 0 in ERASE and WRITE
+ * If you are brave, you have your code just below bootloader in NRWW section
+ *   you could do fill-erase-write sequence with data!=0 in ERASE and
+ *   data=0 in WRITE
+ */
+static void do_spm(uint16_t address, uint8_t command, uint16_t data) {
+    // Do spm stuff
+    asm volatile (
+	"    movw  r0, %3\n"
+    "    out %0, %1\n"
+    "    spm\n"
+    "    clr  r1\n"
+    :
+    : "i" (_SFR_IO_ADDR(__SPM_REG)),
+        "r" ((uint8_t)command),
+        "z" ((uint16_t)address),
+        "r" ((uint16_t)data)
+    : "r0"
+    );
+
+    // wait for spm to complete
+    //   it doesn't have much sense for __BOOT_PAGE_FILL,
+    //   but it doesn't hurt and saves some bytes on 'if'
+    boot_spm_busy_wait();
+#if defined(RWWSRE)
+    // this 'if' condition should be: (command == __BOOT_PAGE_WRITE || command == __BOOT_PAGE_ERASE)...
+    // but it's tweaked a little assuming that in every command we are interested in here, there
+    // must be also SELFPRGEN set. If we skip checking this bit, we save here 4B
+    if ((command & (_BV(PGWRT)|_BV(PGERS))) && (data == 0) ) {
+      // Reenable read access to flash
+      boot_rww_enable();
+    }
+#endif
 }
